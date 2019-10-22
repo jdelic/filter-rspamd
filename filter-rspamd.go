@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"github.com/jdelic/opensmtpd-filters-go"
 	"os"
 	"strings"
 
@@ -29,27 +30,6 @@ import (
 )
 
 var rspamdURL *string
-
-type tx struct {
-	msgid    string
-	mailFrom string
-	rcptTo   []string
-	message  []string
-	action   string
-	response string
-}
-
-type session struct {
-	id       string
-
-	rdns     string
-	src      string
-	heloName string
-	userName string
-	mtaName  string
-
-	tx       tx
-}
 
 type rspamd struct {
 	Score         float32
@@ -67,125 +47,25 @@ type rspamd struct {
 	Symbols map[string]interface{} `json:"symbols"`
 }
 
-var sessions = make(map[string]*session)
-
-var reporters = map[string]func(*session, []string){
-	"link-connect":    linkConnect,
-	"link-disconnect": linkDisconnect,
-	"link-greeting":   linkGreeting,
-	"link-identify":   linkIdentify,
-	"link-auth":       linkAuth,
-	"tx-reset":        txReset,
-	"tx-begin":        txBegin,
-	"tx-mail":         txMail,
-	"tx-rcpt":         txRcpt,
+type filterRspamd struct {
+	opensmtpd.SessionTrackingMixin
 }
 
-var filters = map[string]func(*session, []string){
-	"data-line": dataLine,
-	"commit":    dataCommit,
+type rspamdAction struct {
+	action string
+	response string
 }
 
-func linkConnect(s *session, params []string) {
-	if len(params) != 4 {
-		log.Fatal("invalid input, shouldn't happen")
+func (f *filterRspamd) MessageComplete(token string, session *opensmtpd.SMTPSession) {
+	replies := make(chan rspamdAction)
+	go rspamdQuery(replies, token, session)
+	// TODO: CONTINUE HERE
+	action := <- replies
+
+	switch action.action {
+	case "flush":
+		opensmtpd.FlushMessage(token, session)
 	}
-
-	s.rdns = params[0]
-	s.src = params[2]
-}
-
-func linkDisconnect(s *session, params []string) {
-	if len(params) != 0 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-	delete(sessions, s.id)
-}
-
-func linkGreeting(s *session, params []string) {
-	if len(params) != 1 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	s.mtaName = params[0]
-}
-
-func linkIdentify(s *session, params []string) {
-	if len(params) != 2 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	s.heloName = params[1]
-}
-
-func linkAuth(s *session, params []string) {
-	if len(params) != 2 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-	if params[1] != "pass" {
-		return
-	}
-
-	s.userName = params[0]
-}
-
-func txReset(s *session, params []string) {
-	if len(params) != 1 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	s.tx = tx{}
-}
-
-func txBegin(s *session, params []string) {
-	if len(params) != 1 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	s.tx.msgid = params[0]
-}
-
-func txMail(s *session, params []string) {
-	if len(params) != 3 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	if params[2] != "ok" {
-		return
-	}
-
-	s.tx.mailFrom = params[1]
-}
-
-func txRcpt(s *session, params []string) {
-	if len(params) != 3 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	if params[2] != "ok" {
-		return
-	}
-
-	s.tx.rcptTo = append(s.tx.rcptTo, params[1])
-}
-
-func dataLine(s *session, params []string) {
-	if len(params) < 2 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	token := params[0]
-	line := strings.Join(params[1:], "|")
-
-	if line == "." {
-		go rspamdQuery(s, token)
-		return
-	}
-
-	// Input is raw SMTP data - unescape leading dots.
-	line = strings.TrimPrefix(line, ".")
-
-	s.tx.message = append(s.tx.message, line)
 }
 
 func dataCommit(s *session, params []string) {
@@ -216,83 +96,48 @@ func dataCommit(s *session, params []string) {
 	}
 }
 
-func filterInit() {
-	for k := range reporters {
-		fmt.Printf("register|report|smtp-in|%s\n", k)
-	}
-	for k := range filters {
-		fmt.Printf("register|filter|smtp-in|%s\n", k)
-	}
-	fmt.Println("register|ready")
-}
-
-func flushMessage(s *session, token string) {
-	for _, line := range s.tx.message {
-		writeLine(s, token, line)
-	}
-	fmt.Printf("filter-dataline|%s|%s|.\n", token, s.id)
-}
-
-func writeLine(s *session, token string, line string) {
-	prefix := ""
-	// Output raw SMTP data - escape leading dots.
-	if strings.HasPrefix(line, ".") {
-		prefix = "."
-	}
-	fmt.Printf("filter-dataline|%s|%s|%s%s\n", token, s.id, prefix, line)
-}
-
-func writeHeader(s *session, token string, h string, t string) {
-	for i, line := range strings.Split(t, "\n") {
-		if i == 0 {
-			fmt.Printf("filter-dataline|%s|%s|%s: %s\n",
-				token, s.id, h, line)
-		} else {
-			fmt.Printf("filter-dataline|%s|%s|%s\n",
-				token, s.id, line)
-		}
-	}
-}
-
-func rspamdQuery(s *session, token string) {
-	r := strings.NewReader(strings.Join(s.tx.message, "\n"))
+func rspamdQuery(replyChan chan rspamdAction, token string, session *opensmtpd.SMTPSession) {
+	r := strings.NewReader(strings.Join(session.Message, "\n"))
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s/checkv2", *rspamdURL), r)
 	if err != nil {
-		flushMessage(s, token)
+		opensmtpd.FlushMessage(token, session)
 		return
 	}
 
 	req.Header.Add("Pass", "All")
-	if !strings.HasPrefix(s.src, "unix:") {
-		if s.src[0] == '[' {
-			ip := strings.Split(strings.Split(s.src, "]")[0], "[")[1]
+	if !strings.HasPrefix(session.Src, "unix:") {
+		if session.Src[0] == '[' {
+			ip := strings.Split(strings.Split(session.Src, "]")[0], "[")[1]
 			req.Header.Add("Ip", ip)
 		} else {
-			ip := strings.Split(s.src, ":")[0]
+			ip := strings.Split(session.Src, ":")[0]
 			req.Header.Add("Ip", ip)
 		}
 	} else {
 		req.Header.Add("Ip", "127.0.0.1")
 	}
 
-	req.Header.Add("Hostname", s.rdns)
-	req.Header.Add("Helo", s.heloName)
-	req.Header.Add("MTA-Name", s.mtaName)
-	req.Header.Add("Queue-Id", s.tx.msgid)
-	req.Header.Add("From", s.tx.mailFrom)
+	req.Header.Add("Hostname", session.Rdns)
+	req.Header.Add("Helo", session.HeloName)
+	req.Header.Add("MTA-Name", session.MtaName)
+	req.Header.Add("Queue-Id", session.Msgid)
+	req.Header.Add("From", session.MailFrom)
 
-	if s.userName != "" {
-		req.Header.Add("User", s.userName)
+	if session.UserName != "" {
+		req.Header.Add("User", session.UserName)
 	}
 
-	for _, rcptTo := range s.tx.rcptTo {
+	for _, rcptTo := range session.RcptTo {
 		req.Header.Add("Rcpt", rcptTo)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		flushMessage(s, token)
+		replyChan <- rspamdAction{
+			action:   "flush",
+			response: "",
+		}
 		return
 	}
 
@@ -300,7 +145,10 @@ func rspamdQuery(s *session, token string) {
 
 	rr := &rspamd{}
 	if err := json.NewDecoder(resp.Body).Decode(rr); err != nil {
-		flushMessage(s, token)
+		replyChan <- rspamdAction{
+			action:   "flush",
+			response: "",
+		}
 		return
 	}
 
@@ -310,14 +158,15 @@ func rspamdQuery(s *session, token string) {
 	case "greylist":
 		fallthrough
 	case "soft reject":
-		s.tx.action   = rr.Action
-		s.tx.response = rr.Messages.SMTP
-		flushMessage(s, token)
+		replyChan <- rspamdAction{
+			action:   rr.Action,
+			response: rr.Messages.SMTP,
+		}
 		return
 	}
 
 	if rr.DKIMSig != "" {
-		writeHeader(s, token, "DKIM-Signature", rr.DKIMSig)
+		opensmtpd.WriteMultilineHeader(token, session.Id, "DKIM-Signature", rr.DKIMSig)
 	}
 
 	if rr.Action == "add header" {
@@ -337,7 +186,7 @@ func rspamdQuery(s *session, token string) {
 					buf = fmt.Sprintf("%s,\n\t%s", buf, k)
 				}
 			}
-			writeHeader(s, token, "X-Spam-Symbols", buf)
+			opensmtpd.WriteMultilineHeader(token, session.Id,"X-Spam-Symbols", buf)
 		}
 	}
 
