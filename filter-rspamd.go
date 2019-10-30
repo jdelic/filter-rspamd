@@ -68,12 +68,10 @@ func (f *filterRspamd) MessageComplete(token string, session *opensmtpd.SMTPSess
 	}
 }
 
-func dataCommit(s *session, params []string) {
+func (f *filterRspamd) Commit(fw opensmtpd.FilterWrapper, sessionId string, sessions opensmtpd.SessionHolder, token string, params []string) {
 	if len(params) != 2 {
 		log.Fatal("invalid input, shouldn't happen")
 	}
-
-	token := params[0]
 
 	switch s.tx.action {
 	case "reject":
@@ -96,7 +94,7 @@ func dataCommit(s *session, params []string) {
 	}
 }
 
-func rspamdQuery(replyChan chan rspamdAction, token string, session *opensmtpd.SMTPSession) {
+func rspamdQuery(replyChan chan<- rspamdAction, token string, session *opensmtpd.SMTPSession) {
 	r := strings.NewReader(strings.Join(session.Message, "\n"))
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s/checkv2", *rspamdURL), r)
@@ -171,9 +169,9 @@ func rspamdQuery(replyChan chan rspamdAction, token string, session *opensmtpd.S
 
 	if rr.Action == "add header" {
 		fmt.Printf("filter-dataline|%s|%s|%s: %s\n",
-			token, s.id, "X-Spam", "yes")
+			token, session.Id, "X-Spam", "yes")
 		fmt.Printf("filter-dataline|%s|%s|%s: %s\n",
-			token, s.id, "X-Spam-Score",
+			token, session.Id, "X-Spam-Score",
 			fmt.Sprintf("%v / %v",
 				rr.Score, rr.RequiredScore))
 
@@ -214,7 +212,7 @@ func rspamdQuery(replyChan chan rspamdAction, token string, session *opensmtpd.S
 			 * Insert these at the top.
 			 */
 			case string:
-				writeHeader(s, token, h, v)
+				opensmtpd.WriteMultilineHeader(token, session.Id, h, v)
 			default:
 			}
 		}
@@ -231,7 +229,7 @@ func rspamdQuery(replyChan chan rspamdAction, token string, session *opensmtpd.S
 
 			for _, h := range hdrs {
 				if authHeaders[h] != "" {
-					writeHeader(s, token, h, authHeaders[h])
+					opensmtpd.WriteMultilineHeader(token, session.Id, h, authHeaders[h])
 				}
 			}
 		}
@@ -242,7 +240,7 @@ func rspamdQuery(replyChan chan rspamdAction, token string, session *opensmtpd.S
 
 LOOP:
 
-	for _, line := range s.tx.message {
+	for _, line := range session.Message {
 		if line == "" {
 			inhdr = false
 			rmhdr = false
@@ -264,69 +262,17 @@ LOOP:
 			}
 		}
 		if rr.Action == "rewrite subject" && inhdr && strings.HasPrefix(line, "Subject: ") {
-			fmt.Printf("filter-dataline|%s|%s|Subject: %s\n", token, s.id, rr.Subject)
+			opensmtpd.DatalineReply(token, session.Id, fmt.Sprintf("Subject: %s", rr.Subject))
 		} else {
-			writeLine(s, token, line)
+			opensmtpd.DatalineReply(token, session.Id, line)
 		}
 	}
-	fmt.Printf("filter-dataline|%s|%s|.\n", token, s.id)
-}
-
-func trigger(actions map[string]func(*session, []string), atoms []string) {
-	if atoms[4] == "link-connect" {
-		// special case to simplify subsequent code
-		s := session{}
-		s.id = atoms[5]
-		sessions[s.id] = &s
-	}
-
-	s := sessions[atoms[5]]
-	if v, ok := actions[atoms[4]]; ok {
-		v(s, atoms[6:])
-	} else {
-		os.Exit(1)
-	}
-}
-
-func skipConfig(scanner *bufio.Scanner) {
-	for {
-		if !scanner.Scan() {
-			os.Exit(0)
-		}
-		line := scanner.Text()
-		if line == "config|ready" {
-			return
-		}
-	}
+	opensmtpd.DatalineEnd(token, session.Id)
 }
 
 func main() {
 	rspamdURL = flag.String("url", "http://localhost:11333", "rspamd base url")
 	flag.Parse()
 
-	scanner := bufio.NewScanner(os.Stdin)
-
-	skipConfig(scanner)
-
-	filterInit()
-
-	for {
-		if !scanner.Scan() {
-			os.Exit(0)
-		}
-
-		atoms := strings.Split(scanner.Text(), "|")
-		if len(atoms) < 6 {
-			os.Exit(1)
-		}
-
-		switch atoms[0] {
-		case "report":
-			trigger(reporters, atoms)
-		case "filter":
-			trigger(filters, atoms)
-		default:
-			os.Exit(1)
-		}
-	}
+	opensmtpd.Run(opensmtpd.NewFilter(filterRspamd{}))
 }
