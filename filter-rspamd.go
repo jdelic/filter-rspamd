@@ -17,15 +17,12 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"github.com/jdelic/opensmtpd-filters-go"
-	"os"
 	"strings"
 
 	"encoding/json"
-	"log"
 	"net/http"
 )
 
@@ -51,46 +48,42 @@ type filterRspamd struct {
 	opensmtpd.SessionTrackingMixin
 }
 
+func (f *filterRspamd) GetName() string {
+	return "filter-rspamd"
+}
+
 type rspamdAction struct {
 	action string
 	response string
 }
 
+
 func (f *filterRspamd) MessageComplete(token string, session *opensmtpd.SMTPSession) {
 	replies := make(chan rspamdAction)
 	go rspamdQuery(replies, token, session)
-	// TODO: CONTINUE HERE
 	action := <- replies
 
 	switch action.action {
 	case "flush":
 		opensmtpd.FlushMessage(token, session)
-	}
-}
-
-func (f *filterRspamd) Commit(fw opensmtpd.FilterWrapper, sessionId string, sessions opensmtpd.SessionHolder, token string, params []string) {
-	if len(params) != 2 {
-		log.Fatal("invalid input, shouldn't happen")
-	}
-
-	switch s.tx.action {
+		opensmtpd.Proceed(token, session.Id)
 	case "reject":
-		if s.tx.response == "" {
-			s.tx.response = "message rejected"
+		if action.response == "" {
+			action.response = "message rejected"
 		}
-		fmt.Printf("filter-result|%s|%s|reject|550 %s\n", token, s.id, s.tx.response)
+		opensmtpd.HardReject(token, session.Id, action.response)
 	case "greylist":
-		if s.tx.response == "" {
-			s.tx.response = "try again later"
+		if action.response == "" {
+			action.response = "try again later"
 		}
-		fmt.Printf("filter-result|%s|%s|reject|421 %s\n", token, s.id, s.tx.response)
+		opensmtpd.Greylist(token, session.Id, action.response)
 	case "soft reject":
-		if s.tx.response == "" {
-			s.tx.response = "try again later"
+		if action.response == "" {
+			action.response = "try again later"
 		}
-		fmt.Printf("filter-result|%s|%s|reject|451 %s\n", token, s.id, s.tx.response)
+		opensmtpd.SoftReject(token, session.Id, action.response)
 	default:
-		fmt.Printf("filter-result|%s|%s|proceed\n", token, s.id)
+		opensmtpd.Proceed(token, session.Id)
 	}
 }
 
@@ -168,12 +161,9 @@ func rspamdQuery(replyChan chan<- rspamdAction, token string, session *opensmtpd
 	}
 
 	if rr.Action == "add header" {
-		fmt.Printf("filter-dataline|%s|%s|%s: %s\n",
-			token, session.Id, "X-Spam", "yes")
-		fmt.Printf("filter-dataline|%s|%s|%s: %s\n",
-			token, session.Id, "X-Spam-Score",
-			fmt.Sprintf("%v / %v",
-				rr.Score, rr.RequiredScore))
+		opensmtpd.DatalineReply(token, session.Id, fmt.Sprintf("%s: %s\n", "X-Spam", "yes"))
+		opensmtpd.DatalineReply(token, session.Id, fmt.Sprintf("%s: %s\n", "X-Spam-Score",
+			fmt.Sprintf("%v / %v", rr.Score, rr.RequiredScore)))
 
 		if len(rr.Symbols) != 0 {
 			buf := ""
@@ -184,7 +174,7 @@ func rspamdQuery(replyChan chan<- rspamdAction, token string, session *opensmtpd
 					buf = fmt.Sprintf("%s,\n\t%s", buf, k)
 				}
 			}
-			opensmtpd.WriteMultilineHeader(token, session.Id,"X-Spam-Symbols", buf)
+			opensmtpd.WriteMultilineHeader(token, session.Id, "X-Spam-Symbols", buf)
 		}
 	}
 
@@ -274,5 +264,5 @@ func main() {
 	rspamdURL = flag.String("url", "http://localhost:11333", "rspamd base url")
 	flag.Parse()
 
-	opensmtpd.Run(opensmtpd.NewFilter(filterRspamd{}))
+	opensmtpd.Run(opensmtpd.NewFilter(&filterRspamd{}))
 }
