@@ -1,5 +1,11 @@
 # filter-rspamd
 
+## Fork notice
+
+This is a proof-of-concept fork of [poolpOrg/filter-rspamd](https://github.com/poolpOrg/filter-rspamd)
+to show off a port to my [opensmtpd-filters-go](https://github.com/jdelic/opensmtpd-filters-go)
+library.
+
 ## Description
 This filter implements the Rspamd protocol and allows OpenSMTPD to request an Rspamd analysis
 of an SMTP transaction before a message is committed to queue.
